@@ -1,3 +1,4 @@
+
 name: Build Ganj Library (Windows 7 SP1 x86)
 
 on:
@@ -5,9 +6,6 @@ on:
     branches:
       - main
       - master
-    paths:
-      - '**'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
@@ -15,8 +13,6 @@ permissions:
 
 jobs:
   build:
-    # The runner is only the build machine. The target executable is built
-    # with the 32-bit MinGW toolchain and Qt 5.15.2.
     runs-on: windows-2022
     timeout-minutes: 30
 
@@ -27,119 +23,201 @@ jobs:
       MINGW_ROOT: 'C:\Qt\Tools\mingw810_32'
 
     steps:
+
+      # ---------------------------------------
+      # 1. Checkout
+      # ---------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ---------------------------------------
+      # 2. Locate project
+      # ---------------------------------------
 
       - name: Locate and extract project
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Support either a repository containing the project directly,
-          # or a repository containing the original project ZIP.
-          $cmake = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter 'CMakeLists.txt' -File -Recurse |
-            Where-Object { $_.FullName -notmatch '[\\/](build|_build|extracted)[\\/]' } |
+          $cmake = Get-ChildItem -Path $env:GITHUB_WORKSPACE `
+            -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](build|_build|extracted)[\\/]'
+            } |
             Select-Object -First 1
 
           if (-not $cmake) {
-            $zip = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter '*.zip' -File -Recurse |
+
+            $zip = Get-ChildItem -Path $env:GITHUB_WORKSPACE `
+              -Filter '*.zip' -File -Recurse |
               Select-Object -First 1
 
             if (-not $zip) {
-              throw 'Neither CMakeLists.txt nor a project ZIP file was found.'
+              throw 'CMakeLists.txt and project ZIP not found.'
             }
 
             $extractDir = Join-Path $env:GITHUB_WORKSPACE 'extracted'
-            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-            Write-Host "Extracting $($zip.FullName) to $extractDir"
-            Expand-Archive -Path $zip.FullName -DestinationPath $extractDir -Force
 
-            $cmake = Get-ChildItem -Path $extractDir -Filter 'CMakeLists.txt' -File -Recurse |
+            New-Item -ItemType Directory -Force `
+              -Path $extractDir | Out-Null
+
+            Expand-Archive -Path $zip.FullName `
+              -DestinationPath $extractDir -Force
+
+            $cmake = Get-ChildItem -Path $extractDir `
+              -Filter 'CMakeLists.txt' -File -Recurse |
               Select-Object -First 1
           }
 
           if (-not $cmake) {
-            throw 'CMakeLists.txt was not found after extraction.'
+            throw 'CMakeLists.txt not found.'
           }
 
           $projectDir = $cmake.DirectoryName
+
           Write-Host "Project directory: $projectDir"
 
-          if (-not (Test-Path (Join-Path $projectDir 'installer\ganj.iss'))) {
-            throw 'installer\ganj.iss was not found in the project directory.'
+          if (-not (Test-Path "$projectDir\installer\ganj.iss")) {
+            throw 'installer\ganj.iss not found.'
           }
 
-          "PROJECT_DIR=$projectDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PROJECT_DIR=$projectDir" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install CMake, Ninja and Python
+      # ---------------------------------------
+      # 3. Install build tools
+      # ---------------------------------------
+
+      - name: Install build tools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cmake --version
+
           python --version
-          # Ninja is installed explicitly so the generator is predictable.
+          cmake --version
+
           python -m pip install --upgrade pip
           python -m pip install aqtinstall ninja
 
-      - name: Install Qt 5.15.2 and MinGW 8.1 (32-bit)
+      # ---------------------------------------
+      # 4. Install Qt and MinGW
+      # ---------------------------------------
+
+      - name: Install Qt 5.15.2 and MinGW 8.1
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          python -m aqt install-qt windows desktop $env:QT_VERSION $env:QT_ARCH -O C:\Qt
-          python -m aqt install-tool windows desktop tools_mingw qt.tools.win32_mingw810 -O C:\Qt
+          python -m aqt install-qt windows desktop `
+            $env:QT_VERSION $env:QT_ARCH -O C:\Qt
+
+          python -m aqt install-tool windows desktop `
+            tools_mingw qt.tools.win32_mingw810 -O C:\Qt
 
           $qt = $env:QT_ROOT
           $mingw = $env:MINGW_ROOT
 
-          foreach ($required in @(
+          $requiredFiles = @(
             "$qt\bin\qmake.exe",
             "$qt\bin\windeployqt.exe",
             "$qt\plugins\platforms\qwindows.dll",
             "$qt\plugins\sqldrivers\qsqlite.dll",
+            "$mingw\bin\gcc.exe",
             "$mingw\bin\g++.exe",
             "$mingw\bin\windres.exe",
             "$mingw\bin\objdump.exe"
-          )) {
-            if (-not (Test-Path $required)) {
-              throw "Required Qt/MinGW file was not installed: $required"
+          )
+
+          foreach ($file in $requiredFiles) {
+            if (!(Test-Path $file)) {
+              throw "Required file not found: $file"
             }
           }
 
           & "$qt\bin\qmake.exe" -query
           & "$mingw\bin\g++.exe" --version
 
-      - name: Configure and build (Release, x86)
+      # ---------------------------------------
+      # 5. Configure and build
+      # ---------------------------------------
+
+      - name: Configure and build (Release x86)
         shell: pwsh
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $env:PATH = "$env:MINGW_ROOT\bin;$env:QT_ROOT\bin;$env:PATH"
-          $env:QT_PLUGIN_PATH = "$env:QT_ROOT\plugins"
+          $mingw = $env:MINGW_ROOT
+          $qt = $env:QT_ROOT
+
+          # Normalize paths for CMake.
+          # This fixes the invalid \Q escape error.
+
+          $gcc = (Join-Path $mingw 'bin\gcc.exe').Replace('\', '/')
+          $gxx = (Join-Path $mingw 'bin\g++.exe').Replace('\', '/')
+          $windres = (Join-Path $mingw 'bin\windres.exe').Replace('\', '/')
+          $qtPath = $qt.Replace('\', '/')
+
+          $env:PATH = "$mingw\bin;$qt\bin;$env:PATH"
+
+          # Clean previous CMake cache.
+
+          if (Test-Path build) {
+            Remove-Item build -Recurse -Force
+          }
+
+          # Configure CMake.
 
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER="$env:MINGW_ROOT/bin/gcc.exe" `
-            -DCMAKE_CXX_COMPILER="$env:MINGW_ROOT/bin/g++.exe" `
-            -DCMAKE_RC_COMPILER="$env:MINGW_ROOT/bin/windres.exe" `
-            -DCMAKE_PREFIX_PATH="$env:QT_ROOT" `
-            -DCMAKE_FIND_ROOT_PATH="$env:QT_ROOT"
+            "-DCMAKE_C_COMPILER:FILEPATH=$gcc" `
+            "-DCMAKE_CXX_COMPILER:FILEPATH=$gxx" `
+            "-DCMAKE_RC_COMPILER:FILEPATH=$windres" `
+            "-DCMAKE_PREFIX_PATH:PATH=$qtPath"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'CMake configuration failed.'
+          }
+
+          # Compile project.
 
           cmake --build build --parallel
 
-          $exe = Join-Path (Get-Location) 'build\Ganj.exe'
-          if (-not (Test-Path $exe)) {
-            throw "Build did not produce $exe"
-          }
-
-          # Verify that the executable is 32-bit Intel (PE i386).
-          & "$env:MINGW_ROOT\bin\objdump.exe" -f $exe
           if ($LASTEXITCODE -ne 0) {
-            throw 'Could not inspect the architecture of Ganj.exe.'
+            throw 'Project compilation failed.'
           }
 
-      - name: Deploy Qt, SQL and MinGW runtime dependencies
+          # Check executable.
+
+          $exe = Join-Path (Get-Location) 'build\Ganj.exe'
+
+          if (!(Test-Path $exe)) {
+            throw 'Ganj.exe was not generated.'
+          }
+
+          # Verify x86 architecture.
+
+          $architecture = & "$mingw\bin\objdump.exe" -f $exe 2>&1 |
+            Out-String
+
+          Write-Host $architecture
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not inspect executable architecture.'
+          }
+
+          if ($architecture -notmatch 'architecture:\s*i386') {
+            throw 'Ganj.exe is not a 32-bit x86 executable.'
+          }
+
+          Write-Host 'BUILD SUCCESSFUL - x86'
+
+      # ---------------------------------------
+      # 6. Deploy Qt dependencies
+      # ---------------------------------------
+
+      - name: Deploy Qt and MinGW dependencies
         shell: pwsh
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
@@ -147,82 +225,100 @@ jobs:
 
           $qt = $env:QT_ROOT
           $mingw = $env:MINGW_ROOT
+
           $env:PATH = "$mingw\bin;$qt\bin;$env:PATH"
+
           $env:QT_PLUGIN_PATH = "$qt\plugins"
           $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$qt\plugins\platforms"
 
           $deploy = Join-Path (Get-Location) 'deploy'
-          New-Item -ItemType Directory -Force -Path $deploy | Out-Null
+
+          New-Item -ItemType Directory -Force `
+            -Path $deploy | Out-Null
+
           Copy-Item 'build\Ganj.exe' $deploy -Force
 
-          # Tell windeployqt explicitly where this Qt installation and its
-          # platform plugins are located. The deploy directory is the
-          # application directory, so platforms\qwindows.dll is beside Ganj.exe.
+          # Deploy Qt dependencies.
+
           & "$qt\bin\windeployqt.exe" `
             --release `
             --compiler-runtime `
             --sql `
             --no-translations `
-            --no-system-d3d-compiler `
-            --no-opengl-sw `
-            --no-angle `
             --dir $deploy `
             --plugindir $deploy `
             (Join-Path $deploy 'Ganj.exe')
 
           if ($LASTEXITCODE -ne 0) {
-            throw "windeployqt failed with exit code $LASTEXITCODE"
+            throw 'windeployqt deployment failed.'
           }
 
-          # Explicitly ensure the two plugins required by this application
-          # are present, even if windeployqt's plugin detection changes.
-          $platformSource = Join-Path $qt 'plugins\platforms\qwindows.dll'
-          $sqliteSource = Join-Path $qt 'plugins\sqldrivers\qsqlite.dll'
+          # Ensure Windows platform plugin.
 
-          if (-not (Test-Path $platformSource)) {
-            throw "Missing Qt Windows platform plugin: $platformSource"
-          }
-          if (-not (Test-Path $sqliteSource)) {
-            throw "Missing Qt SQLite driver: $sqliteSource"
+          $platform = "$qt\plugins\platforms\qwindows.dll"
+
+          if (!(Test-Path $platform)) {
+            throw 'qwindows.dll not found.'
           }
 
-          New-Item -ItemType Directory -Force -Path (Join-Path $deploy 'platforms') | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $deploy 'sqldrivers') | Out-Null
-          Copy-Item $platformSource (Join-Path $deploy 'platforms\qwindows.dll') -Force
-          Copy-Item $sqliteSource (Join-Path $deploy 'sqldrivers\qsqlite.dll') -Force
+          New-Item -ItemType Directory -Force `
+            -Path "$deploy\platforms" | Out-Null
 
-          # Keep Qt's plugin lookup relative to the application folder.
+          Copy-Item $platform "$deploy\platforms\qwindows.dll" -Force
+
+          # Ensure SQLite plugin.
+
+          $sqlite = "$qt\plugins\sqldrivers\qsqlite.dll"
+
+          if (!(Test-Path $sqlite)) {
+            throw 'qsqlite.dll not found.'
+          }
+
+          New-Item -ItemType Directory -Force `
+            -Path "$deploy\sqldrivers" | Out-Null
+
+          Copy-Item $sqlite "$deploy\sqldrivers\qsqlite.dll" -Force
+
+          # Configure Qt plugin paths.
+
           @'
           [Paths]
           Prefix=.
           Plugins=.
-          '@ | Set-Content -Path (Join-Path $deploy 'qt.conf') -Encoding ASCII
+          '@ | Set-Content "$deploy\qt.conf" -Encoding ASCII
 
-          # Copy MinGW runtime libraries if windeployqt did not already copy them.
-          foreach ($dll in @(
+          # Copy MinGW runtime DLLs.
+
+          $runtimeDLLs = @(
             'libgcc_s_dw2-1.dll',
             'libstdc++-6.dll',
             'libwinpthread-1.dll'
-          )) {
-            $source = Join-Path $mingw "bin\$dll"
-            $destination = Join-Path $deploy $dll
+          )
 
-            if (-not (Test-Path $source)) {
-              throw "Missing MinGW runtime library: $source"
+          foreach ($dll in $runtimeDLLs) {
+
+            $source = "$mingw\bin\$dll"
+            $destination = "$deploy\$dll"
+
+            if (!(Test-Path $source)) {
+              throw "MinGW runtime missing: $dll"
             }
-            if (-not (Test-Path $destination)) {
+
+            if (!(Test-Path $destination)) {
               Copy-Item $source $destination -Force
             }
           }
 
-          # Include application fonts when the project contains them.
-          $fonts = Join-Path (Get-Location) 'resources\fonts'
-          if (Test-Path $fonts) {
-            Copy-Item $fonts (Join-Path $deploy 'fonts') -Recurse -Force
+          # Copy fonts.
+
+          if (Test-Path 'resources\fonts') {
+            Copy-Item 'resources\fonts' "$deploy\fonts" `
+              -Recurse -Force
           }
 
-          # Fail early if essential deployment files are absent.
-          $requiredFiles = @(
+          # Validate deployment.
+
+          $required = @(
             'Ganj.exe',
             'Qt5Core.dll',
             'Qt5Gui.dll',
@@ -236,43 +332,61 @@ jobs:
             'qt.conf'
           )
 
-          foreach ($relative in $requiredFiles) {
-            $path = Join-Path $deploy $relative
-            if (-not (Test-Path $path)) {
-              throw "Deployment validation failed. Missing: $relative"
+          foreach ($file in $required) {
+
+            if (!(Test-Path "$deploy\$file")) {
+              throw "Deployment file missing: $file"
             }
+
+            Write-Host "OK: $file"
           }
 
-          Write-Host 'Deployment contents:'
-          Get-ChildItem $deploy -Recurse | Select-Object FullName
+          Write-Host 'DEPLOYMENT SUCCESSFUL'
 
-      - name: Build installer with Inno Setup
+          Get-ChildItem $deploy -Recurse |
+            Select-Object FullName
+
+      # ---------------------------------------
+      # 7. Build installer
+      # ---------------------------------------
+
+      - name: Build installer
         shell: pwsh
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          choco install innosetup --yes --no-progress
+          choco install innosetup -y --no-progress
+
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 
-          if (-not (Test-Path $iscc)) {
-            throw "Inno Setup compiler not found: $iscc"
+          if (!(Test-Path $iscc)) {
+            throw 'Inno Setup compiler not found.'
           }
 
           & $iscc 'installer\ganj.iss'
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Inno Setup failed with exit code $LASTEXITCODE"
+            throw 'Inno Setup compilation failed.'
           }
 
-          $setup = Join-Path (Get-Location) 'dist\GanjLibrarySetup.exe'
-          if (-not (Test-Path $setup)) {
-            throw "Installer was not created: $setup"
+          $setup = Join-Path (Get-Location) `
+            'dist\GanjLibrarySetup.exe'
+
+          if (!(Test-Path $setup)) {
+            throw 'Installer file was not generated.'
           }
 
-          Write-Host "Installer created: $setup"
-          Get-Item $setup | Select-Object FullName, Length
+          Get-Item $setup |
+            Select-Object FullName, Length
 
-      - name: Upload installer artifact
+          Write-Host 'INSTALLER CREATED SUCCESSFULLY'
+
+      # ---------------------------------------
+      # 8. Upload artifact
+      # ---------------------------------------
+
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: GanjLibrarySetup-Windows7-x86
